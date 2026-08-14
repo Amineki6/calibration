@@ -261,3 +261,186 @@ def run_jtt_stage1(
         torch.cuda.empty_cache()
 
     logging.info("--- JTT Stage 2: Upweighted Training Phase ---")
+
+
+def run_dfr_stage1(
+    config, datamodule, study_root, trial_number, run_name, wandb_group, debug, no_wandb=False
+):
+    logging.info("--- DFR Stage 1: ERM Base Training ---")
+
+    csv_dir = Path(config.csv_dir)
+    data_dir = Path(config.data_dir)
+    features_dir = Path(config.features_dir) if config.features_dir else None
+
+    if config.dfr_stage1_use_v2_csv:
+        train_csv = csv_dir / "train_drain_shortcut_v2.csv"
+    else:
+        train_csv = csv_dir / "train_drain_shortcut.csv"
+
+    backbone = getattr(config, "backbone", "densenet")
+
+    stage1_train_dataset = CXP_dataset(
+        data_dir,
+        train_csv,
+        augment=True,
+        compute_sample_weights=False,
+        split_name="train_stage1",
+        backbone=backbone,
+        use_cached_features=config.use_cached_features,
+        features_dir=features_dir,
+    )
+
+    if debug:
+        from torch.utils.data import Subset
+        stage1_train_dataset = Subset(
+            stage1_train_dataset, range(min(len(stage1_train_dataset), 50))
+        )
+
+    stage1_train_loader = DataLoader(
+        stage1_train_dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=True,
+        prefetch_factor=2 if config.num_workers > 0 else None,
+    )
+
+    # Init Stage 1 Model using StandardMethod
+    import methods
+    method_stage1 = methods.get_method("standard", config)
+    model_1 = CXP_Model(method_stage1, backbone=config.backbone, use_cached_features=config.use_cached_features)
+
+    stage1_run_name = (
+        f"{run_name}_stage1" if run_name else f"trial_{trial_number}_stage1"
+    )
+    coolname_any = cast(Any, coolname)
+    if hasattr(coolname_any, "generate_slug"):
+        run_id_suffix = coolname_any.generate_slug(2)
+    else:
+        run_id_suffix = "-".join(coolname_any.generate(2))
+
+    wandb_logger_1 = WandbLogger(
+        project="cxr_optuna_study",
+        group=wandb_group,
+        name=stage1_run_name,
+        config=config.__dict__,
+        save_dir=str(study_root),
+        id=f"{stage1_run_name}_{run_id_suffix}",
+        mode="disabled" if no_wandb else "online",
+    )
+
+    pl_module_1 = CXPLightningModule(model_1, method_stage1, config)
+
+    monitor_metric = ""
+    mode = ""
+    if config.select_chkpt_on.upper() == "AUROC":
+        monitor_metric = "val/auroc"
+        mode = "max"
+    elif config.select_chkpt_on.upper() == "WAUROC":
+        monitor_metric = "val/wauroc"
+        mode = "max"
+    elif config.select_chkpt_on.upper() == "FAIRNESS":
+        monitor_metric = "val/fairness_score"
+        mode = "max"
+    elif config.select_chkpt_on.upper() == "BCE":
+        monitor_metric = "val/bce"
+        mode = "min"
+    elif config.select_chkpt_on.upper() == "WBCE":
+        monitor_metric = "val/wbce"
+        mode = "min"
+    elif config.select_chkpt_on.upper() == "WORST_GROUP":
+        monitor_metric = "val/worst_group_accuracy"
+        mode = "max"
+    else:
+        monitor_metric = "val/loss"
+        mode = "min"
+
+    checkpoint_callback_1 = ModelCheckpoint(
+        dirpath=study_root / "checkpoints",
+        filename=f"trial_{trial_number}_dfr_stage1_best",
+        monitor=monitor_metric,
+        mode=mode,
+        save_top_k=1,
+        save_last=False,
+    )
+
+    trainer_1 = pl.Trainer(
+        max_epochs=config.dfr_stage1_epochs,
+        accelerator="auto",
+        devices="auto",
+        logger=wandb_logger_1,
+        callbacks=[checkpoint_callback_1],
+        enable_progress_bar=True,
+        log_every_n_steps=10 if debug else 10,
+        enable_checkpointing=True,
+        num_sanity_val_steps=0,
+        precision="16-mixed",
+        deterministic=True,
+    )
+
+    datamodule.setup("fit")
+
+    # datamodule.val_dataloader() is the Stage-2 *selection* half of the val
+    # split, so Stage-1 checkpoint selection never touches the rows the Stage-2
+    # head will be trained on.
+    trainer_1.fit(
+        pl_module_1,
+        train_dataloaders=stage1_train_loader,
+        val_dataloaders=datamodule.val_dataloader(),
+    )
+
+    best_model_path = checkpoint_callback_1.best_model_path
+    logging.info(f"DFR Stage 1 Complete. Best model saved at: {best_model_path}")
+
+    wandb_logger_1.experiment.finish()
+    del trainer_1, pl_module_1, model_1
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return best_model_path
+
+
+def _load_dfr_stage1_encoder(model: CXP_Model, checkpoint_path: str) -> None:
+    """
+    Copy only the encoder weights out of a DFR Stage-1 checkpoint (the Stage-1
+    head is an MLP and is deliberately discarded).
+    """
+    if not any(p.numel() for p in model.encoder.parameters()):
+        # use_cached_features=True -> encoder is nn.Identity(); there is nothing
+        # to transfer and Stage 2 is a linear probe on the cached features.
+        logging.info("DFR: encoder is parameterless (cached features); skipping load.")
+        return
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["state_dict"]
+
+    prefix = "model.encoder."
+    encoder_state_dict = {
+        k[len("model.") :]: v for k, v in state_dict.items() if k.startswith(prefix)
+    }
+    if not encoder_state_dict:
+        raise RuntimeError(
+            f"No '{prefix}*' weights found in {checkpoint_path}. Stage 2 would "
+            "have trained on a randomly initialized encoder."
+        )
+
+    incompatible = model.load_state_dict(encoder_state_dict, strict=False)
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            f"Unexpected encoder keys in {checkpoint_path}: "
+            f"{incompatible.unexpected_keys[:10]}"
+        )
+    unloaded_encoder_keys = [
+        k for k in incompatible.missing_keys if k.startswith("encoder.")
+    ]
+    if unloaded_encoder_keys:
+        raise RuntimeError(
+            f"Encoder keys missing from {checkpoint_path}: "
+            f"{unloaded_encoder_keys[:10]}"
+        )
+
+    logging.info(
+        "DFR: loaded %d encoder tensors from %s",
+        len(encoder_state_dict),
+        checkpoint_path,
+    )

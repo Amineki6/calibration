@@ -5,6 +5,7 @@ from pathlib import Path
 import coolname
 
 import torch
+import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -18,7 +19,7 @@ os.environ["WANDB__SERVICE_WAIT"] = "300"
 from config import ExperimentConfig, get_config
 from model import CXP_Model
 import methods
-from utils import run_jtt_stage1, TeeStream
+from utils import run_jtt_stage1, run_dfr_stage1, TeeStream, _load_dfr_stage1_encoder
 from lightning_module import CXPLightningModule
 from lightning_datamodule import CXPDataModule
 
@@ -72,6 +73,7 @@ def setup_logging(root_dir):
         )
 
     sys.excepthook = exception_handler
+
 
 
 def _stage_banner(title: str) -> None:
@@ -180,13 +182,54 @@ def run_lightning_training(
             no_wandb=args.no_wandb,
         )
 
+    # --- DFR STAGE 1 ---
+    dfr_best_model_path = None
+    if config.method == "dfr":
+        dfr_best_model_path = run_dfr_stage1(
+            config,
+            datamodule,
+            study_root,
+            trial_number,
+            run_name,
+            wandb_group=wandb_group,
+            debug=args.debug,
+            no_wandb=args.no_wandb,
+        )
+        config.epochs = config.dfr_stage2_epochs
+
     # --- MAIN TRAINING ---
 
     # Init Model
     model = CXP_Model(
         method, backbone=config.backbone, use_cached_features=config.use_cached_features
     )
-    pl_module = CXPLightningModule(model, method, config)
+
+    # DFR Stage 2 surgery must happen BEFORE CXPLightningModule is constructed:
+    # the module deep-copies `model` into its EMA wrapper, and validation/test
+    # forward through that copy. Loading afterwards would evaluate a model that
+    # never saw the Stage-1 encoder.
+    freeze_encoder = config.method == "dfr" and dfr_best_model_path is not None
+    if freeze_encoder:
+        _load_dfr_stage1_encoder(model, dfr_best_model_path)
+
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+        model.encoder.eval()
+
+        nn.init.xavier_uniform_(model.clf.weight)
+        if model.clf.bias is not None:
+            nn.init.zeros_(model.clf.bias)
+
+        n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logging.info(
+            "DFR Stage 2: encoder frozen and in eval(); head re-initialized. "
+            "Trainable params in CXP_Model: %d",
+            n_trainable,
+        )
+
+    pl_module = CXPLightningModule(
+        model, method, config, freeze_encoder=freeze_encoder
+    )
 
     # Logger
     final_run_name = run_name if run_name else f"{args.study_name}_trial_{trial_number}"
@@ -417,6 +460,11 @@ def main():
             chkpt_path = study_root / "checkpoints" / f"trial_{trial.number}_best.ckpt"
             if chkpt_path.exists():
                 chkpt_path.unlink()
+                
+            dfr_chkpt_path = study_root / "checkpoints" / f"trial_{trial.number}_dfr_stage1_best.ckpt"
+            if dfr_chkpt_path.exists():
+                dfr_chkpt_path.unlink()
+                
             return best_score
 
         best_params = run_optimization_study(args, study_root, objective)

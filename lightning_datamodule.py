@@ -1,5 +1,8 @@
+import logging
+
+import numpy as np
 import pytorch_lightning as pl
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 import torch
 from typing import Optional
 from pathlib import Path
@@ -7,6 +10,44 @@ from pathlib import Path
 from config import ExperimentConfig
 from dataset import CXP_dataset
 from utils import get_jtt_loader
+
+
+def _resolve_base_and_indices(dataset):
+    """Unwrap nested Subsets into (base_dataset, absolute row indices)."""
+    ds = dataset
+    idx = None
+    while isinstance(ds, Subset):
+        parent_idx = np.asarray(ds.indices, dtype=np.int64)
+        idx = parent_idx if idx is None else parent_idx[idx]
+        ds = ds.dataset
+    if idx is None:
+        idx = np.arange(len(ds), dtype=np.int64)
+    return ds, idx
+
+
+def _subgroup_ids(dataset):
+    """(Pneumothorax, Drain) subgroup id per row exposed by `dataset`."""
+    base, idx = _resolve_base_and_indices(dataset)
+    labels = base.labels.to_numpy()[idx].astype(np.int64)
+    drain = base.drain.to_numpy()[idx]
+    # NaN drain rows get a placeholder id; callers filter them via the returned
+    # drain array (casting NaN to int directly is undefined).
+    drain_int = np.where(np.isnan(drain), 0.0, drain).astype(np.int64)
+    return labels * 2 + drain_int, drain
+
+
+def _group_sample_weights(dataset) -> torch.Tensor:
+    """Inverse-frequency weights over the four (Pneumothorax, Drain) subgroups."""
+    groups, drain = _subgroup_ids(dataset)
+    if np.isnan(drain).any():
+        raise ValueError(
+            "Group balancing requires non-missing Drain labels, but the split "
+            "contains Drain=NaN rows."
+        )
+    counts = np.bincount(groups, minlength=4).astype(np.float32)
+    inv = np.zeros_like(counts)
+    inv[counts > 0] = 1.0 / counts[counts > 0]
+    return torch.from_numpy(inv[groups])
 
 
 class CXPDataModule(pl.LightningDataModule):
@@ -20,6 +61,43 @@ class CXPDataModule(pl.LightningDataModule):
         self.test_dataset_misaligned = None
         self.train_sampler = None
         self.jtt_error_indices = None  # For JTT Stage 2
+        # DFR Stage 2 balances its own (val-derived) head-training split,
+        # independently of config.balance_train.
+        self._dfr_stage2_balance = False
+
+    def _split_dfr_pool(self, pool):
+        """
+        Stratified split of the val pool into a head-training half and a
+        disjoint selection half. Rows without a Drain label are dropped: DFR
+        needs subgroup annotations on both halves.
+        """
+        groups, drain = _subgroup_ids(pool)
+        known = ~np.isnan(drain)
+        if not known.all():
+            logging.info(
+                "DFR: dropping %d/%d val rows with missing Drain labels.",
+                int((~known).sum()),
+                len(known),
+            )
+
+        rng = np.random.default_rng(self.config.dfr_split_seed)
+        train_idx, select_idx = [], []
+        for g in np.unique(groups[known]):
+            g_idx = np.flatnonzero(known & (groups == g))
+            rng.shuffle(g_idx)
+            n_train = int(round(len(g_idx) * self.config.dfr_stage2_train_fraction))
+            n_train = min(max(n_train, 1), max(len(g_idx) - 1, 1))
+            train_idx.append(g_idx[:n_train])
+            select_idx.append(g_idx[n_train:])
+
+        train_idx = np.sort(np.concatenate(train_idx))
+        select_idx = np.sort(np.concatenate(select_idx))
+        logging.info(
+            "DFR Stage 2 split: %d head-training rows, %d selection rows (disjoint).",
+            len(train_idx),
+            len(select_idx),
+        )
+        return Subset(pool, train_idx.tolist()), Subset(pool, select_idx.tolist())
 
     def setup(self, stage: Optional[str] = None):
         csv_dir = Path(self.config.csv_dir)
@@ -36,26 +114,43 @@ class CXPDataModule(pl.LightningDataModule):
                 train_csv = csv_dir / "train_drain_shortcut.csv"
                 val_csv = csv_dir / "val_drain_shortcut.csv"
 
-            self.train_dataset = CXP_dataset(
-                data_dir,
-                train_csv,
-                augment=True,
-                compute_sample_weights=self.config.balance_train,
-                split_name="train",
-                backbone=self.config.backbone,
-                use_cached_features=self.config.use_cached_features,
-                features_dir=features_dir,
-            )
-            self.val_dataset = CXP_dataset(
-                data_dir,
-                val_csv,
-                augment=False,
-                compute_sample_weights=True,
-                split_name="val",
-                backbone=self.config.backbone,
-                use_cached_features=self.config.use_cached_features,
-                features_dir=features_dir,
-            )
+            if self.config.method == "dfr":
+                # Stage 2 retrains the head on the val split, so the val pool is
+                # halved: one half trains the head, the other selects the
+                # checkpoint. Both come from one dataset instance (no augment).
+                dfr_pool = CXP_dataset(
+                    data_dir,
+                    val_csv,
+                    augment=False,
+                    compute_sample_weights=True,
+                    split_name="dfr_stage2_pool",
+                    backbone=self.config.backbone,
+                    use_cached_features=self.config.use_cached_features,
+                    features_dir=features_dir,
+                )
+                self.train_dataset, self.val_dataset = self._split_dfr_pool(dfr_pool)
+                self._dfr_stage2_balance = True
+            else:
+                self.train_dataset = CXP_dataset(
+                    data_dir,
+                    train_csv,
+                    augment=True,
+                    compute_sample_weights=self.config.balance_train,
+                    split_name="train",
+                    backbone=self.config.backbone,
+                    use_cached_features=self.config.use_cached_features,
+                    features_dir=features_dir,
+                )
+                self.val_dataset = CXP_dataset(
+                    data_dir,
+                    val_csv,
+                    augment=False,
+                    compute_sample_weights=True,
+                    split_name="val",
+                    backbone=self.config.backbone,
+                    use_cached_features=self.config.use_cached_features,
+                    features_dir=features_dir,
+                )
 
         if stage == "test" or stage is None:
             self.test_dataset_aligned = CXP_dataset(
@@ -99,33 +194,13 @@ class CXPDataModule(pl.LightningDataModule):
 
             self.config.balance_train = False  # specific to debug mode logic in utils
 
-        if self.config.balance_train and not self.jtt_error_indices:
-            if self.train_dataset.drain.isna().any():
-                raise ValueError(
-                    "balance_train=True currently requires non-missing Drain labels, "
-                    "but train split contains Drain=NaN rows."
-                )
-            # Basic balancing (not JTT stage 2)
-            pneu_msk = self.train_dataset.labels == 1
-            drain_counts_pneu = torch.bincount(
-                torch.from_numpy(self.train_dataset.drain[pneu_msk].values)
-            )
-            drain_weights_pneu = 1.0 / drain_counts_pneu.float()
-            drain_counts_nopneu = torch.bincount(
-                torch.from_numpy(self.train_dataset.drain[~pneu_msk].values)
-            )
-            drain_weights_nopneu = 1.0 / drain_counts_nopneu.float()
-
-            sample_weights = torch.zeros_like(
-                torch.from_numpy(self.train_dataset.labels.values), dtype=torch.float32
-            )
-            sample_weights[pneu_msk] = drain_weights_pneu[
-                self.train_dataset.drain[pneu_msk].values
-            ]
-            sample_weights[~pneu_msk] = drain_weights_nopneu[
-                self.train_dataset.drain[~pneu_msk].values
-            ]
-
+        # Built last, so the weights always match whatever train_dataset ended up
+        # as (debug subset, DFR Stage-2 half, ...).
+        needs_balancing = self._dfr_stage2_balance or (
+            self.config.balance_train and not self.jtt_error_indices
+        )
+        if needs_balancing:
+            sample_weights = _group_sample_weights(self.train_dataset)
             self.train_sampler = WeightedRandomSampler(
                 sample_weights, num_samples=len(sample_weights), replacement=True
             )

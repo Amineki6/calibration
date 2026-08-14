@@ -16,11 +16,20 @@ from scoring import (
 
 
 class CXPLightningModule(pl.LightningModule):
-    def __init__(self, model: CXP_Model, method, config: ExperimentConfig):
+    def __init__(
+        self,
+        model: CXP_Model,
+        method,
+        config: ExperimentConfig,
+        freeze_encoder: bool = False,
+    ):
         super().__init__()
         self.save_hyperparameters(ignore=["model", "method"])
         self.model: CXP_Model = model
         self.config = config
+        # Linear-probe mode (DFR Stage 2): the encoder stays frozen AND in eval()
+        # for the whole run, so BatchNorm running stats cannot drift under the head.
+        self.freeze_encoder = freeze_encoder
 
         # Clone method templates for train/val/test to maintain separate loss states.
         # Note: We must pass `dataset_size` during cloning because certain methods
@@ -64,6 +73,8 @@ class CXPLightningModule(pl.LightningModule):
         self.automatic_optimization = True
 
     def _should_train_encoder(self) -> bool:
+        if self.freeze_encoder:
+            return False
         return self.config.backbone == "densenet" and self.current_epoch >= 5
 
     def _sync_encoder_trainability(self) -> None:
@@ -124,6 +135,11 @@ class CXPLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         batch_data = batch
+
+        if self.freeze_encoder:
+            # Belt and braces: keep BN/dropout in inference mode even if some
+            # other hook flipped the encoder back to train().
+            self.model.encoder.eval()
 
         model_output = self.model(batch_data.inputs)
         extra_info = batch_data.extra_info()
@@ -481,18 +497,32 @@ class CXPLightningModule(pl.LightningModule):
         self.test_misaligned_outputs.clear()
 
     def configure_optimizers(self):
-        params = [
-            {"params": self.model.encoder.parameters(), "lr": self.config.lr / 5},
-            {"params": self.model.clf.parameters(), "lr": self.config.lr},
-        ]
+        encoder_params = list(filter(lambda p: p.requires_grad, self.model.encoder.parameters()))
+        clf_params = list(filter(lambda p: p.requires_grad, self.model.clf.parameters()))
+
+        params = []
+        if encoder_params:
+            params.append({"params": encoder_params, "lr": self.config.lr / 5})
+
+        clf_weight_decay = self.config.weight_decay
+        if self.freeze_encoder and self.config.method == "dfr":
+            clf_weight_decay = getattr(
+                self.config, "dfr_stage2_weight_decay", self.config.weight_decay
+            )
+
+        if clf_params:
+            params.append({"params": clf_params, "lr": self.config.lr, "weight_decay": clf_weight_decay})
 
         if self.model.projection_head is not None:
-            params.append(
-                {
-                    "params": self.model.projection_head.parameters(),
-                    "lr": self.config.lr,
-                }
-            )
+            proj_params = list(filter(lambda p: p.requires_grad, self.model.projection_head.parameters()))
+            if proj_params:
+                params.append(
+                    {
+                        "params": proj_params,
+                        "lr": self.config.lr,
+                        "weight_decay": self.config.weight_decay, # DFR doesn't use projection, but standard default
+                    }
+                )
 
         if torch.cuda.is_available() and torch.__version__ >= "2.0":
             optimizer = optim.AdamW(

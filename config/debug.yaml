@@ -11,4 +11,6 @@ score_matching_lambda: 1.0
 dataset_score_matching_lambda: 1.0
 jtt_duration: 1
 jtt_lambda: 4.0
+dfr_stage1_epochs: 2
+dfr_stage2_epochs: 2
 soft_eo_lambda: 1.0

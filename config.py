@@ -38,6 +38,17 @@ class ExperimentConfig:
     soft_eo_temp_schedule_epochs: int = 25
     jtt_duration: int = 1
     jtt_lambda: float = 4.0
+    dfr_stage1_epochs: int = 150
+    dfr_stage2_epochs: int = 30
+    dfr_stage2_weight_decay: float = 0.05
+    # Fraction of the val split used to retrain the DFR head; the remainder is
+    # held back for checkpoint selection so Stage 2 never selects on its own
+    # training data.
+    dfr_stage2_train_fraction: float = 0.5
+    dfr_split_seed: int = 42
+    # Stage-1 CSV variant. Kept separate from balance_val so that turning on
+    # val balancing does not silently swap the Stage-1 training split.
+    dfr_stage1_use_v2_csv: bool = False
 
     balance_train: bool = False
     balance_val: bool = False
@@ -123,6 +134,10 @@ def get_config(args: argparse.Namespace, trial=None) -> ExperimentConfig:
         elif config.method == "soft_equalized_odds":
             config.soft_eo_lambda = trial.suggest_float(
                 "soft_eo_lambda", 1e-3, 1e2, log=True
+            )
+        elif config.method == "dfr":
+            config.dfr_stage2_weight_decay = trial.suggest_float(
+                "dfr_stage2_weight_decay", 1e-4, 1.0, log=True
             )
 
     return config
