@@ -123,7 +123,7 @@ def main():
 
                 for idx_in_batch, original_idx in enumerate(batch_data.indices):
                     original_idx = original_idx.item()
-                    path_str = str(base_dataset.path[original_idx])
+                    path_str = str(base_dataset.path.iloc[original_idx])
                     features_dict[path_str] = features[idx_in_batch].clone()
 
         torch.save(features_dict, out_file)

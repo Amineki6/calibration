@@ -220,7 +220,7 @@ class CXP_dataset(torchvision.datasets.VisionDataset):
         self.root_dir = root_dir
         self.path = df.Path.str.replace(
             "CheXpert-v1.0/", "CheXpert-v1.0-small/", regex=False
-        )
+        ).reset_index(drop=True)
         self.idx = df.index
         self.transform = transform
 
@@ -259,9 +259,9 @@ class CXP_dataset(torchvision.datasets.VisionDataset):
         else:
             self.features_dict = None
 
-        self.labels = df.Pneumothorax.astype(int)
+        self.labels = df.Pneumothorax.astype(int).reset_index(drop=True)
         # Drain stays float because some rows legitimately carry NaN for missing group labels.
-        self.drain = pd.to_numeric(df.Drain, errors="coerce").astype(np.float32)
+        self.drain = pd.to_numeric(df.Drain, errors="coerce").astype(np.float32).reset_index(drop=True)
 
         # Drop rows whose image path is missing to avoid repeated runtime retries/log spam.
         exists_mask = self.path.map(
