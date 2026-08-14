@@ -229,7 +229,24 @@ class CXP_dataset(torchvision.datasets.VisionDataset):
                 raise ValueError(
                     "features_dir must be provided when use_cached_features is True"
                 )
-            feature_file = Path(features_dir) / f"{backbone}_{self.split_name}.pt"
+            
+            # Map custom split names back to the original cached feature files
+            if self.split_name in ["test_aligned", "test_misaligned"]:
+                cache_split = self.split_name
+            else:
+                csv_stem = Path(csv_file).stem
+                if csv_stem == "train_drain_shortcut":
+                    cache_split = "train"
+                elif csv_stem == "train_drain_shortcut_v2":
+                    cache_split = "train_v2"
+                elif csv_stem == "val_drain_shortcut":
+                    cache_split = "val"
+                elif csv_stem == "val_drain_shortcut_v2":
+                    cache_split = "val_v2"
+                else:
+                    cache_split = self.split_name
+
+            feature_file = Path(features_dir) / f"{backbone}_{cache_split}.pt"
             if not feature_file.exists():
                 raise FileNotFoundError(
                     f"Cached features not found: {feature_file}. "
