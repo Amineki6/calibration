@@ -103,7 +103,9 @@ class CXPLightningModule(pl.LightningModule):
     def setup(self, stage: str):
         datamodule = getattr(self.trainer, "datamodule", None)
 
-        if stage == "fit":
+        # "validate" is included for DFR, whose Stage 2 is fitted outside the
+        # Lightning loop and therefore runs validation without ever fitting.
+        if stage in ("fit", "validate"):
             train_size = self._get_dataset_size(
                 getattr(datamodule, "train_dataset", None)
             )

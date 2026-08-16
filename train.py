@@ -5,7 +5,6 @@ from pathlib import Path
 import coolname
 
 import torch
-import torch.nn as nn
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -20,6 +19,7 @@ from config import ExperimentConfig, get_config
 from model import CXP_Model
 import methods
 from utils import run_jtt_stage1, run_dfr_stage1, TeeStream, _load_dfr_stage1_encoder
+from dfr_stage2 import is_backbone_frozen, run_dfr_stage2
 from lightning_module import CXPLightningModule
 from lightning_datamodule import CXPDataModule
 
@@ -168,7 +168,12 @@ def run_lightning_training(
     # --- METHOD ---
     method = methods.get_method(config.method, config)
 
+    frozen_backbone = is_backbone_frozen(config)
+
     # --- JTT STAGE 1 ---
+    # NOT skipped for frozen backbones: JTT Stage 1 exists to produce the error
+    # set, and the head still trains under a frozen encoder. Skipping it would
+    # leave jtt_error_indices=None and silently turn JTT into plain ERM.
     if config.method == "jtt":
         run_jtt_stage1(
             config,
@@ -185,17 +190,26 @@ def run_lightning_training(
     # --- DFR STAGE 1 ---
     dfr_best_model_path = None
     if config.method == "dfr":
-        dfr_best_model_path = run_dfr_stage1(
-            config,
-            datamodule,
-            study_root,
-            trial_number,
-            run_name,
-            wandb_group=wandb_group,
-            debug=args.debug,
-            no_wandb=args.no_wandb,
-        )
-        config.epochs = config.dfr_stage2_epochs
+        if frozen_backbone:
+            # ERM cannot move a single weight of a frozen encoder, and the
+            # Stage-1 head is discarded by Stage 2, so Stage 1 has no effect
+            # whatsoever on the result -- it is pure wasted compute here.
+            logging.info(
+                "DFR Stage 1 skipped: backbone=%s is frozen, so ERM cannot change "
+                "the features Stage 2 is fitted on.",
+                config.backbone,
+            )
+        else:
+            dfr_best_model_path = run_dfr_stage1(
+                config,
+                datamodule,
+                study_root,
+                trial_number,
+                run_name,
+                wandb_group=wandb_group,
+                debug=args.debug,
+                no_wandb=args.no_wandb,
+            )
 
     # --- MAIN TRAINING ---
 
@@ -206,24 +220,27 @@ def run_lightning_training(
 
     # DFR Stage 2 surgery must happen BEFORE CXPLightningModule is constructed:
     # the module deep-copies `model` into its EMA wrapper, and validation/test
-    # forward through that copy. Loading afterwards would evaluate a model that
-    # never saw the Stage-1 encoder.
-    freeze_encoder = config.method == "dfr" and dfr_best_model_path is not None
+    # forward through that copy. Fitting the head afterwards would evaluate a
+    # model that never saw either the Stage-1 encoder or the Stage-2 head.
+    freeze_encoder = config.method == "dfr"
+    dfr_stage2_info = None
     if freeze_encoder:
-        _load_dfr_stage1_encoder(model, dfr_best_model_path)
+        if dfr_best_model_path:
+            _load_dfr_stage1_encoder(model, dfr_best_model_path)
 
         for param in model.encoder.parameters():
             param.requires_grad = False
         model.encoder.eval()
 
-        nn.init.xavier_uniform_(model.clf.weight)
-        if model.clf.bias is not None:
-            nn.init.zeros_(model.clf.bias)
+        # Stage 2 needs datamodule.train_dataset (the head-training half of the
+        # val split); Lightning has not called setup() yet at this point.
+        datamodule.setup("fit")
+        dfr_stage2_info = run_dfr_stage2(config, model, datamodule)
 
         n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logging.info(
-            "DFR Stage 2: encoder frozen and in eval(); head re-initialized. "
-            "Trainable params in CXP_Model: %d",
+            "DFR Stage 2: encoder frozen and in eval(); head fitted by sklearn and "
+            "transplanted. Trainable params in CXP_Model: %d",
             n_trainable,
         )
 
@@ -242,6 +259,11 @@ def run_lightning_training(
         id=f"{final_run_name}_{coolname.generate_slug(2)}",
         mode="disabled" if args.no_wandb else "online",
     )
+
+    if dfr_stage2_info is not None:
+        wandb_logger.log_hyperparams(
+            {f"dfr_stage2/{k}": v for k, v in dfr_stage2_info.items()}
+        )
 
     # Checkpointing Logic
     monitor_metric = ""
@@ -293,17 +315,52 @@ def run_lightning_training(
         deterministic=True,  # Enforce reproducibility
     )
 
-    logging.info("[PHASE=%s] Entering train/validation loop.", run_phase)
+    if config.method == "dfr":
+        # The head is already fitted to convergence, so there is nothing left for
+        # gradient descent to do and no checkpoint to select over epochs. Run the
+        # validation pass once to produce the monitored metric (which Optuna and
+        # the selection half consume), then checkpoint the fitted weights.
+        logging.info(
+            "[PHASE=%s] DFR: skipping the training loop; running a single "
+            "validation pass on the held-out selection half.",
+            run_phase,
+        )
+        trainer.validate(pl_module, datamodule=datamodule)
 
-    # Fit
-    trainer.fit(pl_module, datamodule=datamodule)
+        metric_value = trainer.callback_metrics.get(monitor_metric)
+        if metric_value is None:
+            logging.warning(
+                "[PHASE=%s] Monitored metric %s absent after validation; "
+                "reporting the neutral default.",
+                run_phase,
+                monitor_metric,
+            )
+            best_score = 0.0 if mode == "max" else float("inf")
+        else:
+            best_score = float(metric_value)
 
-    # Get Best Metric Value
-    best_score = checkpoint_callback.best_model_score
-    if best_score is not None:
-        best_score = best_score.item()
+        dfr_ckpt_path = study_root / "checkpoints" / f"{checkpoint_filename}.ckpt"
+        dfr_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        trainer.save_checkpoint(dfr_ckpt_path)
+        logging.info(
+            "[PHASE=%s] DFR: saved fitted head to %s (val %s=%s).",
+            run_phase,
+            dfr_ckpt_path,
+            monitor_metric,
+            best_score,
+        )
     else:
-        best_score = 0.0 if mode == "max" else float("inf")
+        logging.info("[PHASE=%s] Entering train/validation loop.", run_phase)
+
+        # Fit
+        trainer.fit(pl_module, datamodule=datamodule)
+
+        # Get Best Metric Value
+        best_score = checkpoint_callback.best_model_score
+        if best_score is not None:
+            best_score = best_score.item()
+        else:
+            best_score = 0.0 if mode == "max" else float("inf")
 
     # --- TESTING ---
     test_results = None
@@ -311,16 +368,21 @@ def run_lightning_training(
         logging.info(
             "[PHASE=%s] Entering test loop (best-checkpoint evaluation).", run_phase
         )
-        best_model_path = checkpoint_callback.best_model_path
+        # DFR has no epoch sweep to select from: the in-memory weights ARE the
+        # fitted head, so test them directly rather than reloading a checkpoint.
+        best_model_path = (
+            "" if config.method == "dfr" else checkpoint_callback.best_model_path
+        )
         if best_model_path:
             test_results = trainer.test(
                 pl_module, datamodule=datamodule, ckpt_path=best_model_path
             )
         else:
-            logging.warning(
-                "[PHASE=%s] No best checkpoint found; testing current in-memory weights.",
-                run_phase,
-            )
+            if config.method != "dfr":
+                logging.warning(
+                    "[PHASE=%s] No best checkpoint found; testing current in-memory weights.",
+                    run_phase,
+                )
             test_results = trainer.test(pl_module, datamodule=datamodule)
 
     wandb_logger.experiment.finish()

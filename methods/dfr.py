@@ -6,15 +6,21 @@ class DFRMethod(BaseMethod):
     """
     Deep Feature Reweighting (DFR) or Last Layer Re-Training.
     Stage 1 uses StandardMethod (ERM).
-    Stage 2 uses this method, providing a simple linear layer and standard BCE loss.
+    Stage 2 discards the Stage-1 head and refits this one on a group-balanced
+    subsample of the validation split (see `dfr_stage2.run_dfr_stage2`).
+
+    The head is intentionally identical to StandardMethod's so that DFR is
+    compared against the other baselines at matched capacity; the loss below is
+    only used for evaluation, since Stage 2 is fitted with sklearn rather than
+    by the Lightning training loop.
     """
 
     def __init__(self, config):
         super().__init__(config)
 
     def get_model_components(self, num_features: int):
-        # DFR only requires a standard linear classifier
-        clf = nn.Linear(num_features, 1)
+        # Same architecture as StandardMethod -- see class docstring.
+        clf = nn.Sequential(nn.Linear(num_features, 512), nn.ReLU(), nn.Linear(512, 1))
         # We return None for the projection head because we don't use it.
         return clf, None
 

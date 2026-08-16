@@ -172,7 +172,15 @@ def run_jtt_stage1(
     )
 
     # Init Stage 1 Model
-    model_1 = CXP_Model(method)  # .to(device) is handled by PL
+    # The backbone/cached-feature settings must match the run config: without
+    # them this silently built a densenet and fed it cached foundation-model
+    # feature vectors, so the JTT error set was garbage for every non-densenet
+    # backbone.  .to(device) is handled by PL.
+    model_1 = CXP_Model(
+        method,
+        backbone=config.backbone,
+        use_cached_features=config.use_cached_features,
+    )
 
     # Stage 1 Logger
     stage1_run_name = (

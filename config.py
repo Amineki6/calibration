@@ -39,8 +39,17 @@ class ExperimentConfig:
     jtt_duration: int = 1
     jtt_lambda: float = 4.0
     dfr_stage1_epochs: int = 150
+    # Deprecated: Stage 2 is fitted to convergence by sklearn (see dfr_stage2.py)
+    # and no longer runs a Lightning training loop, so this has no effect. Kept
+    # so existing YAML configs that set it still load.
     dfr_stage2_epochs: int = 30
+    # L2 penalty for the Stage-2 head; passed to MLPClassifier(alpha=...).
     dfr_stage2_weight_decay: float = 0.05
+    # Stage-2 solver budget. max_iter is an upper bound: fitting stops early once
+    # the loss fails to improve by `tol` for `n_iter_no_change` iterations.
+    dfr_stage2_max_iter: int = 2000
+    dfr_stage2_n_iter_no_change: int = 25
+    dfr_stage2_tol: float = 1e-5
     # Fraction of the val split used to retrain the DFR head; the remainder is
     # held back for checkpoint selection so Stage 2 never selects on its own
     # training data.
@@ -136,6 +145,8 @@ def get_config(args: argparse.Namespace, trial=None) -> ExperimentConfig:
                 "soft_eo_lambda", 1e-3, 1e2, log=True
             )
         elif config.method == "dfr":
+            # Tuned on the disjoint selection half of the val split; this is the
+            # MLPClassifier `alpha` (the DFR "inverse regularization strength").
             config.dfr_stage2_weight_decay = trial.suggest_float(
                 "dfr_stage2_weight_decay", 1e-4, 1.0, log=True
             )
