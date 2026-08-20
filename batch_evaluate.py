@@ -615,10 +615,10 @@ def _log_group_prevalence(logger: logging.Logger, name: str, df: pd.DataFrame) -
 def _cache_paths(cache_dir: Path, checkpoint_name: str) -> dict[str, Path]:
     stem = Path(checkpoint_name).stem
     return {
-        "meta": cache_dir / f"{stem}_meta.json",
-        "val_preds": cache_dir / f"{stem}_val_predictions.csv",
-        "test_preds": cache_dir / f"{stem}_test_predictions.csv",
-        "calibrators": cache_dir / f"{stem}_beta_calibrators.pkl",
+        "meta": cache_dir / f"{stem}_meta_new.json",
+        "val_preds": cache_dir / f"{stem}_val_predictions_new.csv",
+        "test_preds": cache_dir / f"{stem}_test_predictions_new.csv",
+        "calibrators": cache_dir / f"{stem}_beta_calibrators_new.pkl",
     }
 
 
@@ -677,12 +677,20 @@ def main() -> None:
         run_dir = args.base_path / run_name
         final_eval_dir = run_dir / "final_evaluation"
         checkpoints_dir = final_eval_dir / "checkpoints"
-        cache_dir = final_eval_dir / "recalibration_cache"
-        plots_dir = final_eval_dir / "recalibration_plots"
-        log_path = final_eval_dir / "recalibration_eval.log"
+        cache_dir = final_eval_dir / "recalibration_cache_new"
+        plots_dir = final_eval_dir / "recalibration_plots_new"
+        log_path = final_eval_dir / "recalibration_eval_new.log"
+        metric_keys = ("aligned", "misaligned", "fairness") + CALIBRATION_METRIC_KEYS
 
         if not checkpoints_dir.exists():
-            raise FileNotFoundError(f"Missing checkpoints dir: {checkpoints_dir}")
+            print(f"Skipping {run_name}: Missing checkpoints dir {checkpoints_dir}")
+            empty_scores = {key: [] for key in metric_keys}
+            summary_rows = [
+                {"name": f"{run_name} | original (SKIPPED)", **empty_scores},
+                {"name": f"{run_name} | recalibrated (SKIPPED)", **empty_scores},
+            ]
+            aggregate_rows.extend(summary_rows)
+            continue
 
         cache_dir.mkdir(parents=True, exist_ok=True)
         plots_dir.mkdir(parents=True, exist_ok=True)
@@ -690,9 +698,15 @@ def main() -> None:
 
         checkpoint_paths = sorted(checkpoints_dir.glob(args.checkpoint_glob))
         if not checkpoint_paths:
-            raise FileNotFoundError(
-                f"No checkpoints found in {checkpoints_dir} matching {args.checkpoint_glob}"
-            )
+            logger.warning(f"Skipping {run_name}: No checkpoints found in {checkpoints_dir} matching {args.checkpoint_glob}")
+            empty_scores = {key: [] for key in metric_keys}
+            summary_rows = [
+                {"name": f"{run_name} | original (SKIPPED)", **empty_scores},
+                {"name": f"{run_name} | recalibrated (SKIPPED)", **empty_scores},
+            ]
+            aggregate_rows.extend(summary_rows)
+            logger.handlers.clear()
+            continue
 
         logger.info("Run: %s", run_name)
         logger.info("Base path: %s", args.base_path)
@@ -910,7 +924,7 @@ def main() -> None:
         )
 
         if metrics_rows:
-            metrics_csv = final_eval_dir / "recalibration_metrics.csv"
+            metrics_csv = final_eval_dir / "recalibration_metrics_new.csv"
             pd.DataFrame(metrics_rows).to_csv(metrics_csv, index=False)
             logger.info("Wrote per-checkpoint metrics: %s", metrics_csv)
 
@@ -919,11 +933,11 @@ def main() -> None:
 
     if all_runs_test_dfs:
         overall_test_df = pd.concat(all_runs_test_dfs, ignore_index=True)
-        overall_plots_dir = args.base_path / "recalibration_plots_overall"
+        overall_plots_dir = args.base_path / "recalibration_plots_overall_new"
         overall_plots_dir.mkdir(parents=True, exist_ok=True)
         render_reliability_plots(overall_test_df, overall_plots_dir, "overall_runs")
 
-    aggregate_log_path = args.base_path / "recalibration_eval_summary.log"
+    aggregate_log_path = args.base_path / "recalibration_eval_summary_new.log"
     aggregate_logger = _configure_file_logger(aggregate_log_path)
     aggregate_logger.info(
         _format_summary_block("Aggregated summary across runs", aggregate_rows)
