@@ -655,6 +655,10 @@ def _load_cache_meta(path: Path) -> dict[str, Any]:
 
 
 def main() -> None:
+    # Fix "Too many open files" by changing PyTorch's sharing strategy
+    import torch.multiprocessing
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
     # Set identical PyTorch optimizations as train.py to ensure precision parity
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
@@ -909,6 +913,9 @@ def main() -> None:
 
             plot_prefix = checkpoint_path.stem
             render_reliability_plots(test_df, plots_dir, plot_prefix)
+
+            import gc
+            gc.collect()
 
         summary_rows = [
             {"name": f"{run_name} | original", **original_scores},
