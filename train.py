@@ -429,6 +429,12 @@ def run_final_evaluation_runs(args, best_params, study_root):
 
     for i in range(args.n_eval_runs):
         run_name = f"{args.study_name}_final_run_{i}"
+        
+        # Update seed per run to ensure true variance across final eval runs
+        run_seed = final_config.seed + i
+        pl.seed_everything(run_seed, workers=True)
+        final_config.dfr_split_seed = run_seed
+
         _, test_results = run_lightning_training(
             args=args,
             config=final_config,
@@ -463,6 +469,12 @@ def run_final_evaluation_runs(args, best_params, study_root):
 
 def main():
     args = parse_args()
+    config = get_config(args)
+
+    if args.study_name is None:
+        args.study_name = (
+            coolname.generate_slug(2) + "_" + config.backbone + "_" + config.method
+        )
 
     # Enforce Reproducibility
     pl.seed_everything(42, workers=True)
@@ -470,18 +482,12 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.set_float32_matmul_precision("high")
 
-    config = get_config(args)
     data_dir = Path(config.data_dir)
 
     if config.out_dir == "runs" or config.out_dir is None:
         out_dir = _infer_default_out_dir(data_dir)
     else:
         out_dir = Path(config.out_dir)
-
-    if args.study_name is None:
-        args.study_name = (
-            coolname.generate_slug(2) + "_" + config.backbone + "_" + config.method
-        )
 
     study_root = out_dir / args.study_name
     study_root.mkdir(parents=True, exist_ok=True)
