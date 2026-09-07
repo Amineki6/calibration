@@ -1,15 +1,12 @@
-# Shortcut Learning is a Calibration Problem
+# Prevalence calibration as shortcut mitigation 
 
 <p align="center">
   <img src="images/thumbnail.jpg" alt="Thumbnail">
 </p>
 
-Code repository supporting the paper "Shortcut Learning is a Calibration Problem" 
+Code repository supporting the paper "Prevalence calibration as shortcut mitigation" 
 
 **Mohamed Amine Kina, Eike Petersen**
-
-paper link : [insert link here]
-
 
 
 
