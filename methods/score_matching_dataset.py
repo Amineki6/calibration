@@ -13,6 +13,10 @@ class DatasetScoreMatchingLoss(nn.Module):
     Dataset-level score matching loss that maintains a persistent buffer of predictions
     across the entire dataset. Computes standard deviation using all available predictions but
     only backpropagates gradients through the current batch.
+
+    Binary (num_classes=2): probs are positive-class probabilities of shape (B,) or (B, 1).
+    Multiclass (num_classes=K>2): probs are class probabilities of shape (B, K). For each true
+    class c, the std across groups of the mean score vector is averaged over the K outputs.
     """
 
     score_buffer: torch.Tensor
@@ -24,13 +28,16 @@ class DatasetScoreMatchingLoss(nn.Module):
         dataset_size: int,
         min_subgroup_count: int = 10,
         device: torch.device | str = "cuda",
+        num_classes: int = 2,
     ):
         super().__init__()
         self.min_subgroup_count = max(1, min_subgroup_count)
+        self.num_classes = num_classes
+        score_shape = (dataset_size,) if num_classes == 2 else (dataset_size, num_classes)
 
         # Persistent buffers (not parameters, won't be updated by optimizer)
         self.register_buffer(
-            "score_buffer", torch.full((dataset_size,), float("nan"), device=device)
+            "score_buffer", torch.full(score_shape, float("nan"), device=device)
         )
         self.register_buffer(
             "label_buffer",
@@ -54,8 +61,8 @@ class DatasetScoreMatchingLoss(nn.Module):
         Compute loss using full dataset buffer but only backprop through current batch.
 
         Args:
-            probs: (B,) or (B, 1) predicted probabilities for current batch
-            labels: (B,) true binary labels for current batch
+            probs: (B,) or (B, 1) predicted probabilities for current batch; (B, K) if K>2
+            labels: (B,) true class labels (0..num_classes-1) for current batch
             groups: (B,) group indicators for current batch
             indices: (B,) dataset indices for current batch samples
 
@@ -63,11 +70,12 @@ class DatasetScoreMatchingLoss(nn.Module):
             Scalar loss tensor with gradients only w.r.t. current batch predictions
         """
         # Normalize shapes
-        if probs.dim() == 2:
+        if probs.dim() == 2 and self.num_classes == 2:
             assert probs.shape[1] == 1
             probs = probs.squeeze(1)
 
         B = probs.shape[0]
+        assert probs.shape[1:] == self.score_buffer.shape[1:]
         assert labels.shape == (B,) and groups.shape == (B,) and indices.shape == (B,)
 
         # Keep assignment dtypes consistent with persistent buffers.
@@ -95,7 +103,7 @@ class DatasetScoreMatchingLoss(nn.Module):
 
         # Check valid entries (all three buffers must be valid) AFTER inserting batch data
         valid_mask = (
-            ~torch.isnan(buffer_scores)
+            ~torch.isnan(buffer_scores).reshape(len(buffer_scores), -1).any(dim=1)
             & (buffer_labels >= 0)
             & (buffer_groups != MISSING_GROUP_ID)
         )
@@ -107,42 +115,22 @@ class DatasetScoreMatchingLoss(nn.Module):
         buffer_labels = buffer_labels[valid_mask]
         buffer_groups = buffer_groups[valid_mask]
 
-        # Compute group-wise averages per class
+        # Per true class: std across groups of the group-wise average scores
         unique_groups = buffer_groups.unique()
-        group_pos_avgs = []
-        group_neg_avgs = []
+        class_stds = []
 
-        for g in unique_groups:
-            mask = buffer_groups == g
-            g_labels = buffer_labels[mask]
-            g_scores = buffer_scores[mask]
+        for c in range(self.num_classes):
+            group_avgs = []
+            for g in unique_groups:
+                mask = (buffer_groups == g) & (buffer_labels == c)
+                if mask.sum() >= self.min_subgroup_count:
+                    group_avgs.append(buffer_scores[mask].mean(dim=0))
+            if len(group_avgs) >= 2:
+                class_stds.append(torch.stack(group_avgs).std(dim=0).mean())
 
-            # Positive subgroup
-            pos_mask = g_labels == 1
-            if pos_mask.sum() >= self.min_subgroup_count:
-                group_pos_avgs.append(g_scores[pos_mask].mean())
-
-            # Negative subgroup
-            neg_mask = g_labels == 0
-            if neg_mask.sum() >= self.min_subgroup_count:
-                group_neg_avgs.append(g_scores[neg_mask].mean())
-
-        # Compute standard deviations
-        pos_std = (
-            torch.stack(group_pos_avgs).std() if len(group_pos_avgs) >= 2 else None
-        )
-        neg_std = (
-            torch.stack(group_neg_avgs).std() if len(group_neg_avgs) >= 2 else None
-        )
-
-        if pos_std is not None and neg_std is not None:
-            return (pos_std + neg_std) / 2.0
-        elif pos_std is not None:
-            return pos_std
-        elif neg_std is not None:
-            return neg_std
-        else:
-            return torch.tensor(0.0, device=probs.device, dtype=probs.dtype).detach()
+        if class_stds:
+            return torch.stack(class_stds).mean()
+        return torch.tensor(0.0, device=probs.device, dtype=probs.dtype).detach()
 
     def update(
         self,
@@ -155,12 +143,12 @@ class DatasetScoreMatchingLoss(nn.Module):
         Update buffers after optimizer step (since predictions changed).
 
         Args:
-            probs: (B,) or (B, 1) updated predictions for current batch
-            labels: (B,) true binary labels for current batch
+            probs: (B,) or (B, 1) updated predictions for current batch; (B, K) if K>2
+            labels: (B,) true class labels (0..num_classes-1) for current batch
             groups: (B,) group indicators for current batch
             indices: (B,) dataset indices for current batch samples
         """
-        if probs.dim() == 2:
+        if probs.dim() == 2 and self.num_classes == 2:
             probs = probs.squeeze(1)
 
         probs = probs.to(device=self.score_buffer.device, dtype=self.score_buffer.dtype)
