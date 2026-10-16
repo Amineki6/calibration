@@ -563,7 +563,9 @@ def main():
                 
             return best_score
 
-        best_params = run_optimization_study(args, study_root, objective)
+        best_params = run_optimization_study(
+            args, study_root, objective, config.select_chkpt_on
+        )
 
     else:
         _stage_banner("STAGE 1/3: INITIAL TRAIN+EVAL (NO OPTIMIZATION)")

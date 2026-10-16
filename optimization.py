@@ -7,7 +7,7 @@ import torch
 from wandb.errors import CommError
 
 
-def run_optimization_study(args, study_root, objective_fn):
+def run_optimization_study(args, study_root, objective_fn, select_chkpt_on: str):
     """
     Sets up and runs the Optuna hyperparameter optimization study.
     """
@@ -25,7 +25,7 @@ def run_optimization_study(args, study_root, objective_fn):
         f"Device: {'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'}"
     )
 
-    if "AUROC" in args.select_chkpt_on.upper() or args.select_chkpt_on.upper() in [
+    if "AUROC" in select_chkpt_on.upper() or select_chkpt_on.upper() in [
         "FAIRNESS",
         "WORST_GROUP",
     ]:
@@ -55,7 +55,7 @@ def run_optimization_study(args, study_root, objective_fn):
 
     logging.info("===== STUDY COMPLETED =====")
     logging.info(f"Best Trial Number: {study.best_trial.number}")
-    logging.info(f"Best Value ({args.select_chkpt_on}): {study.best_trial.value}")
+    logging.info(f"Best Value ({select_chkpt_on}): {study.best_trial.value}")
     logging.info("Best Params:")
     for k, v in best_params:
         logging.info(f"  {k}: {v}")
