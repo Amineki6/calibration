@@ -100,6 +100,17 @@ Options (all methods above):
 - `logit_adjustment_missing_group`: how to treat rows with `Drain=NaN` (most of the SIIM training split): `own_group` (default, own estimated prevalence), `no_offset` (plain BCE) or `exclude`.
 - With `balance_train=true`, prevalences are estimated under the sampler weights. The repo's (label, drain)-balanced sampler makes both groups 50/50, so the offsets become ~0.
 
+**Reuse outside this repo.** `methods/logit_adjustment_core.py` depends only on numpy and torch and can be copied into other projects. It provides:
+- `GroupLogitAdjustedLoss`: K-class softmax or binary sigmoid, any integer group ids, `reduction="none"` for custom weighting, and `retarget()` to deploy at a known class prior.
+- `GroupEncoder`: maps one or several attributes, e.g. their intersection site × sex × vendor, to a single group id.
+
+```python
+from logit_adjustment_core import GroupEncoder, GroupLogitAdjustedLoss
+enc = GroupEncoder().fit(train_df[["site", "sex", "vendor"]])
+loss_fn = GroupLogitAdjustedLoss().fit(train_df["label"], enc.transform(train_df))
+loss = loss_fn(logits, targets, torch.as_tensor(enc.transform(batch_df)))  # logits: (B, K)
+```
+
 ### Recalibration
 
 Post-hoc recalibration of trained models, utilizing **groupwise beta calibration**. This technique (Prevalence-aware calibration) adjusts the model's predicted probabilities across different subpopulation groups to mitigate shortcut learning.

@@ -18,10 +18,26 @@ from methods.logit_adjustment import (
     LogitAdjustmentDatasetScoreMatchingMethod,
     LogitAdjustmentMethod,
     LogitAdjustmentScoreMatchingMethod,
-    estimate_group_priors,
-    priors_from_mapping,
 )
+from methods.logit_adjustment_core import GroupClassPriors, estimate_group_class_priors
 from methods.score_matching import ScoreMatchingLoss
+
+
+def estimate_group_priors(labels, groups, sample_weights=None):
+    return estimate_group_class_priors(labels, groups, num_classes=2, sample_weights=sample_weights)
+
+
+def priors_from_mapping(by_group, pooled, missing=None):
+    return GroupClassPriors.from_rates(by_group, pooled, missing)
+
+
+def rates(priors):
+    return {g: float(v[1]) for g, v in priors.by_group.items()}
+
+
+def bin_off(method, g):
+    t = method.la_loss.offset_table
+    return (t[g, 1] - t[g, 0]).item()
 
 
 def logit(p):
@@ -57,15 +73,15 @@ def test_estimate_group_priors_counts_missing_and_weights():
     labels = np.array([1, 0, 0, 0, 1, 1, 1, 0, 1, 0])
     groups = np.array([0, 0, 0, 0, 1, 1, 1, 1, np.nan, np.nan])
     p = estimate_group_priors(labels, groups)
-    assert p.by_group == {0: 0.25, 1: 0.75}
-    assert p.missing == 0.5
-    assert p.pooled == 0.5
+    assert rates(p) == {0: 0.25, 1: 0.75}
+    assert p.missing[1] == 0.5
+    assert p.pooled[1] == 0.5
 
     # Weights re-balance group 0 to 50/50 (positive row gets weight 3).
     w = np.array([3, 1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=float)
     p_w = estimate_group_priors(labels, groups, w)
-    assert p_w.by_group[0] == pytest.approx(0.5)
-    assert p_w.by_group[1] == pytest.approx(0.75)
+    assert p_w.positive_rate(0) == pytest.approx(0.5)
+    assert p_w.positive_rate(1) == pytest.approx(0.75)
 
 
 def test_estimate_group_priors_rejects_bad_input():
@@ -85,14 +101,13 @@ def test_fit_group_priors_from_subset_and_balanced_sampler():
     m = LogitAdjustmentMethod(ExperimentConfig())
     m.fit_group_priors(subset)
     expected = estimate_group_priors(labels[::2], drain[::2])
-    assert m.la_loss.priors.by_group == pytest.approx(expected.by_group)
+    assert rates(m.la_loss.priors) == pytest.approx(rates(expected))
 
     # The repo's balanced sampler (inverse frequency over (y, drain)) -> both groups 50/50
     weights = _group_sample_weights(subset).numpy()
     m.fit_group_priors(subset, sample_weights=weights)
-    assert m.la_loss.priors.by_group[0] == pytest.approx(0.5)
-    assert m.la_loss.priors.by_group[1] == pytest.approx(0.5)
-    assert torch.allclose(m.la_loss.offset_table, torch.zeros(2), atol=1e-6)
+    assert rates(m.la_loss.priors) == pytest.approx({0: 0.5, 1: 0.5})
+    assert torch.allclose(m.la_loss.offset_table, torch.zeros(2, 2), atol=1e-6)
 
 
 # --------------------------------------------------------------------------- loss
@@ -133,9 +148,9 @@ def test_tau_zero_is_plain_bce():
 def test_reference_prior_options(spec, ref):
     priors = priors_from_mapping({0: 0.1, 1: 0.6}, pooled=0.3)
     m = make_method(priors=priors, logit_adjustment_reference_prior=spec)
-    assert m.la_loss.reference_prior == pytest.approx(ref)
-    assert m.la_loss.offset_table[0].item() == pytest.approx(logit(0.1) - logit(ref), rel=1e-5)
-    assert m.la_loss.offset_table[1].item() == pytest.approx(logit(0.6) - logit(ref), rel=1e-5)
+    assert m.la_loss.reference_prior[1] == pytest.approx(ref)
+    assert bin_off(m, 0) == pytest.approx(logit(0.1) - logit(ref), rel=1e-5)
+    assert bin_off(m, 1) == pytest.approx(logit(0.6) - logit(ref), rel=1e-5)
 
 
 def test_invalid_options_raise():
@@ -298,9 +313,9 @@ def test_lightning_setup_fits_priors_before_cloning():
 
     module.setup("fit")
     for m in (module.train_method, module.val_method):
-        assert m.la_loss.priors.by_group == {0: 0.25, 1: 0.75}
+        assert rates(m.la_loss.priors) == {0: 0.25, 1: 0.75}
     module.setup("test")
-    assert module.test_method_aligned.la_loss.priors.by_group == {0: 0.25, 1: 0.75}
+    assert rates(module.test_method_aligned.la_loss.priors) == {0: 0.25, 1: 0.75}
 
 
 def test_lightning_setup_uses_weighted_sampler():
@@ -312,8 +327,7 @@ def test_lightning_setup_uses_weighted_sampler():
     module = CXPLightningModule(cast(Any, _DummyModel()), LogitAdjustmentMethod(cfg), cfg)
     _attach_datamodule(module, ds, sampler)
     module.setup("fit")
-    assert module.train_method.la_loss.priors.by_group[0] == pytest.approx(0.5)
-    assert module.train_method.la_loss.priors.by_group[1] == pytest.approx(0.5)
+    assert rates(module.train_method.la_loss.priors) == pytest.approx({0: 0.5, 1: 0.5})
 
 
 # --------------------------------------------------------------------------- theory check
