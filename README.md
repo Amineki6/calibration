@@ -44,6 +44,8 @@ You can select a shortcut mitigation algorithm by setting the `method` configura
 - `score_matching` & `dataset_score_matching`: Conditional Score Matching (CSM) objectives
 - `soft_equalized_odds`: Soft Equalized Odds penalty
 - `jtt`: Just Train Twice
+- `logit_adjustment`: Group-conditional logit adjustment (prior-corrected BCE); see below
+- `logit_adjustment_score_matching` / `logit_adjustment_dataset_score_matching`: logit adjustment combined with the batch- / dataset-level score matching penalty
 
 ## Usage
 
@@ -74,6 +76,40 @@ python train.py \
     use_cached_features=true
 ```
 *Tip: When using foundation models, pass `use_cached_features=true` to load pre-extracted features instead of running images through the heavy backbone. Make sure you run the `extract_features.py` script first.*
+
+### Logit Adjustment (in-training prevalence calibration)
+
+`methods/logit_adjustment.py` trains with BCE on shifted logits,
+`BCE(z + tau * (logit(pi_g) - logit(pi_ref)), y)`, where `pi_g = P(y=1 | drain=g)` is estimated from the training split and `pi_ref` is a common reference prevalence. At inference the raw score `sigmoid(z)` is used. No group labels are needed at test time.
+
+Under the assumption that the drain affects the image only through a label-independent signature plus the label prior, the population optimum of this loss no longer depends on the drain. Every group is then calibrated at `pi_ref`. With `pi_ref = 0.5` (the default) this is the in-training counterpart of the groupwise prevalence calibration below. The module docstring has the derivation, the relation to score matching, caveats and references.
+
+```bash
+# a) standalone: no hyperparameters by default, so Optuna is skipped automatically
+python train.py --n_eval_runs 5 method=logit_adjustment backbone=medsiglip use_cached_features=true
+
+# b) combined with score matching: Optuna tunes the score-matching lambda
+#    (same upper bound as score_matching-only; lower bound 1e-3 so it can reach standalone LA)
+python train.py --n_trials 50 --n_eval_runs 5 method=logit_adjustment_score_matching backbone=medsiglip use_cached_features=true
+python train.py --n_trials 50 --n_eval_runs 5 method=logit_adjustment_dataset_score_matching backbone=medsiglip use_cached_features=true
+```
+
+Options (all methods above):
+- `logit_adjustment_reference_prior`: `uniform` (0.5, default), `pooled` (training marginal) or a number in (0, 1). This does not affect AUROCs; it affects Brier score and calibration-in-the-large.
+- `logit_adjustment_tau`: offset scale (1.0 = exact prior correction, 0.0 = plain BCE). Set `logit_adjustment_tune_tau=true` to let Optuna search it in [0, 2].
+- `logit_adjustment_missing_group`: how to treat rows with `Drain=NaN` (most of the SIIM training split): `own_group` (default, own estimated prevalence), `no_offset` (plain BCE) or `exclude`.
+- With `balance_train=true`, prevalences are estimated under the sampler weights. The repo's (label, drain)-balanced sampler makes both groups 50/50, so the offsets become ~0.
+
+**Reuse outside this repo.** `methods/logit_adjustment_core.py` depends only on numpy and torch and can be copied into other projects. It provides:
+- `GroupLogitAdjustedLoss`: K-class softmax or binary sigmoid, any integer group ids, `reduction="none"` for custom weighting, and `retarget()` to deploy at a known class prior.
+- `GroupEncoder`: maps one or several attributes, e.g. their intersection site × sex × vendor, to a single group id.
+
+```python
+from logit_adjustment_core import GroupEncoder, GroupLogitAdjustedLoss
+enc = GroupEncoder().fit(train_df[["site", "sex", "vendor"]])
+loss_fn = GroupLogitAdjustedLoss().fit(train_df["label"], enc.transform(train_df))
+loss = loss_fn(logits, targets, torch.as_tensor(enc.transform(batch_df)))  # logits: (B, K)
+```
 
 ### Recalibration
 
