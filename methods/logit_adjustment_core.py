@@ -100,6 +100,12 @@ Building block for custom losses (weights, extra terms):
     adjusted, keep = loss_fn.adjust_logits(logits, groups)
     per_sample = loss_fn(logits, targets, groups, reduction="none")
 
+Extra penalties on the model's scores (e.g. score matching across groups) belong on the
+deployed probabilities softmax(z) / sigmoid(z):
+  - not on softmax(z + delta_g), whose group means differ by construction;
+  - not on per-class logits z_k, whose per-sample offset is unidentified under softmax
+    (a penalty on them can partly be absorbed by that offset).
+
 Group ids are non-negative integers. NaN or negative values mean "group unknown";
 `missing_group` controls those rows ("own_group", "no_offset" or "exclude").
 

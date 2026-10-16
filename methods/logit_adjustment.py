@@ -26,9 +26,13 @@ E[sigmoid(z) | y, g], separately for y = 0 and y = 1.
 * Under the factorisation above, the adjusted-loss optimum depends on x_c only, and
   p(x_c | y) is the same in every group. So E[sigmoid(z*) | y, g] is equal across groups
   and the penalty is zero there. The objectives are compatible at the population level.
-* The penalty must be evaluated on the raw logits z, the deployed score. On z + delta_g
-  the group means differ by construction and the penalty would fight the adjustment. The
-  combined classes below do this correctly.
+* The penalty must be evaluated on the deployed probabilities sigmoid(z), i.e. *without*
+  the training offset. On sigmoid(z + delta_g) the group means differ by construction, and
+  the penalty would fight the adjustment. The combined classes below do this correctly.
+  With a single sigmoid logit, z is identified, so this is unambiguous. In a K-class softmax
+  model, use softmax(z) and never the per-class logits z_k: z_k carries a per-sample offset
+  that cross-entropy leaves unconstrained, and the network could use it to absorb part of a
+  penalty on logit means without changing any probability.
 * Where p(x_c | y, g) depends on g (drained pneumothoraces are treated and often smaller),
   the adjusted-loss optimum legitimately depends on g and score matching pushes against
   it.
@@ -194,7 +198,8 @@ class LogitAdjustmentScoreMatchingMethod(LogitAdjustmentMethod):
     """Logit adjustment + batch-level score matching (`logit_adjustment_score_matching`).
 
     Total loss = la_bce + score_matching_lambda * ScoreMatchingLoss(sigmoid(z), y, g),
-    with the penalty on the *raw* logits z. Re-uses the `score_matching_*` config fields.
+    with the penalty on the unadjusted probabilities sigmoid(z), not sigmoid(z + delta_g).
+    Re-uses the `score_matching_*` config fields.
     """
 
     def __init__(self, config: ExperimentConfig):
@@ -223,7 +228,7 @@ class LogitAdjustmentDatasetScoreMatchingMethod(LogitAdjustmentMethod):
     (`logit_adjustment_dataset_score_matching`).
 
     Total loss = la_bce + dataset_score_matching_lambda * DatasetScoreMatchingLoss(...),
-    penalty on raw-logit probabilities. Re-uses the `dataset_score_matching_*` config
+    penalty on the unadjusted probabilities sigmoid(z). Re-uses the `dataset_score_matching_*` config
     fields and the same buffer-update protocol (`update_loss`).
     """
 
