@@ -24,6 +24,11 @@ score_matching_min_subgroup_count: 1
 dataset_score_matching_lambda: 10.0
 dataset_score_matching_min_subgroup_count: 10
 
+logit_adjustment_reference_prior: "uniform"  # "uniform" (0.5) | "pooled" | number in (0, 1)
+logit_adjustment_tau: 1.0                    # 1.0 = exact prior correction, 0.0 = plain BCE
+logit_adjustment_missing_group: "own_group"  # Drain=NaN rows: "own_group" | "no_offset" | "exclude"
+logit_adjustment_tune_tau: false             # let Optuna search tau in [0, 2]
+
 soft_eo_lambda: 1.0
 soft_eo_mode: "both"
 soft_eo_tau: 0.5

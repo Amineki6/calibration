@@ -29,6 +29,18 @@ class ExperimentConfig:
     score_matching_min_subgroup_count: int = 1
     dataset_score_matching_lambda: float = 10.0
     dataset_score_matching_min_subgroup_count: int = 10
+    # Group-conditional logit adjustment (methods/logit_adjustment.py). Used by
+    # logit_adjustment, logit_adjustment_score_matching and
+    # logit_adjustment_dataset_score_matching; the combined variants additionally use the
+    # score_matching_* / dataset_score_matching_* fields above.
+    # Reference prevalence pi_ref: "uniform" (0.5), "pooled" (train marginal) or a number.
+    logit_adjustment_reference_prior: str = "uniform"
+    # Offset scale; 1.0 = exact Bayes prior correction, 0.0 = plain BCE.
+    logit_adjustment_tau: float = 1.0
+    # Rows with Drain=NaN: "own_group" | "no_offset" | "exclude".
+    logit_adjustment_missing_group: str = "own_group"
+    # If true, Optuna also searches logit_adjustment_tau in [0, 2].
+    logit_adjustment_tune_tau: bool = False
     soft_eo_lambda: float = 1.0
     soft_eo_mode: str = "both"
     soft_eo_tau: float = 0.5
@@ -135,6 +147,28 @@ def get_config(args: argparse.Namespace, trial=None) -> ExperimentConfig:
             config.dataset_score_matching_lambda = trial.suggest_float(
                 "dataset_score_matching_lambda", 1e-1, 1e4, log=True
             )
+        elif config.method in (
+            "logit_adjustment",
+            "logit_adjustment_score_matching",
+            "logit_adjustment_dataset_score_matching",
+        ):
+            # Same upper bounds as the score-matching-only methods, but the lower bound
+            # is two decades smaller: lambda -> 0 recovers standalone logit adjustment,
+            # and the search must be able to get there. Train-set score matching can
+            # work against the adjustment once the head memorises the training set
+            # (see methods/logit_adjustment.py).
+            if config.method == "logit_adjustment_score_matching":
+                config.score_matching_lambda = trial.suggest_float(
+                    "score_matching_lambda", 1e-3, 1000.0, log=True
+                )
+            elif config.method == "logit_adjustment_dataset_score_matching":
+                config.dataset_score_matching_lambda = trial.suggest_float(
+                    "dataset_score_matching_lambda", 1e-3, 1e4, log=True
+                )
+            if config.logit_adjustment_tune_tau:
+                config.logit_adjustment_tau = trial.suggest_float(
+                    "logit_adjustment_tau", 0.0, 2.0
+                )
         elif config.method == "jtt":
             config.jtt_duration = trial.suggest_int(
                 "jtt_duration", 1, max(1, config.epochs // 2)

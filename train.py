@@ -113,6 +113,29 @@ def _get_method_lambda_items(
                 config.dataset_score_matching_min_subgroup_count,
             ),
         ]
+    if config.method in methods.LOGIT_ADJUSTMENT_METHODS:
+        items: list[tuple[str, float | int | str]] = [
+            ("logit_adjustment_tau", config.logit_adjustment_tau),
+            ("logit_adjustment_reference_prior", config.logit_adjustment_reference_prior),
+            ("logit_adjustment_missing_group", config.logit_adjustment_missing_group),
+        ]
+        if config.method == "logit_adjustment_score_matching":
+            items += [
+                ("score_matching_lambda", config.score_matching_lambda),
+                (
+                    "score_matching_min_subgroup_count",
+                    config.score_matching_min_subgroup_count,
+                ),
+            ]
+        elif config.method == "logit_adjustment_dataset_score_matching":
+            items += [
+                ("dataset_score_matching_lambda", config.dataset_score_matching_lambda),
+                (
+                    "dataset_score_matching_min_subgroup_count",
+                    config.dataset_score_matching_min_subgroup_count,
+                ),
+            ]
+        return items
     if config.method == "jtt":
         return [
             ("jtt_lambda", config.jtt_lambda),
@@ -501,7 +524,12 @@ def main():
     )
 
     # Optuna Setup
-    if args.n_trials == 0 or config.method == "standard":
+    # Standalone logit adjustment has no hyperparameter unless tau tuning is requested;
+    # running Optuna would only repeat identical trials.
+    nothing_to_tune = config.method == "standard" or (
+        config.method == "logit_adjustment" and not config.logit_adjustment_tune_tau
+    )
+    if args.n_trials == 0 or nothing_to_tune:
         optimize = False
         logging.info(
             f"Skipping optimization stage: n_trials={args.n_trials}, method={config.method}"
@@ -535,7 +563,9 @@ def main():
                 
             return best_score
 
-        best_params = run_optimization_study(args, study_root, objective)
+        best_params = run_optimization_study(
+            args, study_root, objective, config.select_chkpt_on
+        )
 
     else:
         _stage_banner("STAGE 1/3: INITIAL TRAIN+EVAL (NO OPTIMIZATION)")

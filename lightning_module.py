@@ -3,6 +3,7 @@ import torch.optim as optim
 import pytorch_lightning as pl
 import logging
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from torch.utils.data import WeightedRandomSampler
 from torcheval.metrics import BinaryAUROC
 from typing import Any, Optional
 
@@ -100,8 +101,40 @@ class CXPLightningModule(pl.LightningModule):
             return self._get_dataset_size(dataset.dataset)
         return len(dataset)
 
+    def _fit_method_group_priors(self, datamodule, force: bool) -> None:
+        """Let methods that need training-split statistics (logit adjustment) fit them.
+
+        Runs on the template before cloning, so train/val/test clones share the same
+        statistics. Prevalences are estimated under the train sampler's weights when a
+        WeightedRandomSampler is used, i.e. for the distribution the optimiser sees.
+        """
+        fit = getattr(self.method_template, "fit_group_priors", None)
+        if not callable(fit):
+            return
+        if not force and getattr(self.method_template, "group_priors_fitted", False):
+            return
+        train_dataset = getattr(datamodule, "train_dataset", None)
+        if train_dataset is None:
+            if force:
+                raise RuntimeError(
+                    f"{type(self.method_template).__name__} needs the training dataset "
+                    "to estimate group prevalences, but the datamodule has none."
+                )
+            return
+        sampler = getattr(datamodule, "train_sampler", None)
+        sample_weights = None
+        if isinstance(sampler, WeightedRandomSampler):
+            sample_weights = sampler.weights.detach().cpu().numpy()
+        fit(train_dataset, sample_weights=sample_weights)
+
     def setup(self, stage: str):
         datamodule = getattr(self.trainer, "datamodule", None)
+
+        if stage == "fit":
+            self._fit_method_group_priors(datamodule, force=True)
+        elif stage in ("validate", "test"):
+            # Re-use priors fitted during `fit`; only estimate them if still missing.
+            self._fit_method_group_priors(datamodule, force=False)
 
         # "validate" is included for DFR, whose Stage 2 is fitted outside the
         # Lightning loop and therefore runs validation without ever fitting.
